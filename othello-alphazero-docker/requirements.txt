@@ -1,0 +1,11 @@
+# othello-backend/requirements.txt
+# 核心 Web 框架
+flask
+Flask-CORS
+
+# AI/模型依赖
+numpy
+torch
+
+# 其他辅助库
+tqdm
