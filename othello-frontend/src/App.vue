@@ -9,9 +9,16 @@
 		<OthelloBoard :board="boardState" :board-size="boardSize" :legal-moves="legalMoves" :last-move="lastMove"
 			@move-made="handleHumanMove" />
 
-		<div v-if="gameStatus !== 'Ongoing'" class="game-over-message">
+<!-- 		<div v-if="gameStatus !== 'Ongoing'" class="game-over-message">
 			<h2>{{ gameStatus }}</h2>
 			<button @click="startNewGame({ size: boardSize, firstPlayer: 1 })">Play Again (Human First)</button>
+		</div> -->
+
+		<div class="game-info">
+			<!-- 【悔棋按钮】只有当 historyLength > 1 时才可悔棋 -->
+			<button @click="handleUndoMove" :disabled="isProcessing || historyLength <= 1" class="undo-button">
+				🔙 悔棋 (Undo)
+			</button>
 		</div>
 	</div>
 </template>
@@ -21,13 +28,13 @@
 	import OthelloBoard from './components/OthelloBoard.vue';
 	import GameControls from './components/GameControls.vue';
 
-	// 后端 API 地址，请确保你的 Flask/Python 后端运行在 5000 端口
-	// const API_BASE_URL = 'http://localhost:5001/api/game';
+	// 后端 API 地址，请替换为你的 Hugging Face URL
+	// 请注意，我使用了你的 Hugging Face URL，如果本地调试请改回 localhost
 	const API_BASE_URL = 'https://sodastar-othello-alphazero-docker.hf.space/api/game';
+	// const API_BASE_URL = 'http://localhost:7860/api/game';
 
-	// src/App.vue (在 <script> 内部，export default 外部)
 	const FLIP_ANIMATION_DURATION = 0.4;
-	// const AI_THINK_TIME = 0; // AI 的思考时间现在由后端控制，这里可以设为 0
+
 	function waitForDelay(durationInSeconds) {
 		return new Promise(resolve => setTimeout(resolve, durationInSeconds * 1000));
 	}
@@ -40,32 +47,31 @@
 		},
 		data() {
 			return {
-				boardSize: 8, // 当前板子尺寸
-				boardState: [], // 2D 数组
+				boardSize: 8, // Current board size
+				boardState: [], // 2D array of the board
 				currentPlayer: 1, // 1: Human (O), -1: AI (X)
-				legalMoves: [], // 合法移动列表 [{x, y}, ...]
-				lastMove: null, // 上一步移动 {x, y}
+				legalMoves: [], // List of legal moves [{x, y}, ...]
+				lastMove: null, // Last move made {x, y}
 				gameStatus: 'Initializing',
-				// pieceCounts: { white: 0, black: 0, empty: 0 }, // 黑白棋子计数
-				isProcessing: false, // 防止重复点击和控制 AI 思考状态
+				isProcessing: false, // Prevents duplicated clicks and controls AI turn
+				historyLength: 1, // 【NEW】Tracks the number of historical states for undo logic
 			};
 		},
 		computed: {
 			hasPassAction() {
-				// 只有在游戏进行中且轮到人下，且没有合法移动时，才允许 Pass
+				// Allow Pass only if ongoing, human's turn, and no legal moves
 				return this.legalMoves.length === 0 && this.gameStatus === 'Ongoing' && this.currentPlayer === 1;
 			},
-			pieceCounts() { // 【新增 computed 属性】
+			pieceCounts() {
 				let white = 0;
 				let black = 0;
 
-				// 遍历 boardState (一个 2D 数组)
 				if (this.boardState && this.boardState.length > 0) {
 					this.boardState.forEach(row => {
 						row.forEach(piece => {
-							if (piece === 1) { // 1 代表白棋 (Human)
+							if (piece === 1) { // 1 is Human (White)
 								white++;
-							} else if (piece === -1) { // -1 代表黑棋 (AI)
+							} else if (piece === -1) { // -1 is AI (Black)
 								black++;
 							}
 						});
@@ -83,13 +89,46 @@
 			}
 		},
 		mounted() {
-			// 应用加载时默认开始 8x8，人先手的游戏
+			// Start default 8x8 game, Human first
 			this.startNewGame({
 				size: this.boardSize,
 				firstPlayer: 1
 			});
 		},
 		methods: {
+			// 【NEW】Handles the undo move request
+			async handleUndoMove() {
+				// Prevent undo if processing or at the initial state
+				if (this.isProcessing || this.historyLength <= 1) return;
+
+				this.isProcessing = true;
+				this.gameStatus = 'Undoing Move...';
+
+				try {
+					// Call the new backend undo API
+					const response = await axios.post(`${API_BASE_URL}/undo_move`);
+
+					// Step 1: Update state based on backend response (includes new historyLength)
+					this.updateGameState(response.data);
+
+					// Step 2: Check if AI should automatically move (occurs if AI was the starting player
+					// and we reverted to the initial state, or if the game requires a pass)
+					if (this.gameStatus === 'Ongoing' && this.currentPlayer === -1) {
+						// Auto-trigger AI move
+						this.handleAIMove();
+					} else {
+						// Release lock, waiting for human move
+						this.isProcessing = false;
+					}
+
+				} catch (error) {
+					console.error('Error undoing move:', error.response ? error.response.data : error);
+					this.gameStatus = 'Error during Undo';
+					// Ensure lock is released on error
+					this.isProcessing = false;
+				}
+			},
+
 			async startNewGame(config) {
 				if (this.isProcessing) return;
 				this.isProcessing = true;
@@ -109,14 +148,19 @@
 					});
 
 					this.updateGameState(response.data);
+					// 【FIX】Ensure historyLength is correctly initialized
+					this.historyLength = response.data.history_length || 1;
+
 				} catch (error) {
 					console.error('Error starting new game:', error.response ? error.response.data : error);
 					this.gameStatus = 'Error: Cannot connect to Python Backend (check terminal)';
 				} finally {
-					this.isProcessing = false;
+					// Only release lock if it's human's turn
+					if (this.currentPlayer === 1) {
+						this.isProcessing = false;
+					}
 				}
 			},
-			// src/App.vue (在 methods 内部)
 
 			async handleAIMove() {
 				if (this.gameStatus !== 'Ongoing' || this.currentPlayer !== -1) return;
@@ -125,13 +169,12 @@
 				this.gameStatus = 'AI is thinking...';
 
 				try {
-					// AI 的思考延迟已在后端 app.py 中实现
 					const response = await axios.post(`${API_BASE_URL}/ai_move`);
 
-					// 步骤 1: 更新棋盘状态（触发 AI 翻转动画）
+					// Step 1: Update state (includes historyLength update from backend)
 					this.updateGameState(response.data);
 
-					// 步骤 2: 等待 AI 翻转动画完成
+					// Step 2: Wait for flip animation
 					await waitForDelay(FLIP_ANIMATION_DURATION);
 
 				} catch (error) {
@@ -140,19 +183,14 @@
 				} finally {
 					this.isProcessing = false;
 
-					// 【关键】检查 AI 下完后，游戏是否结束或轮到人
+					// Check if AI needs to Pass or play again
 					if (this.gameStatus === 'Ongoing' && this.currentPlayer === -1) {
-						// 如果 AI 下完后发现自己需要 Pass 或还有机会下，则再次触发 AI 移动
-						// 确保连续 Pass 时的处理
 						this.handleAIMove();
 					}
 				}
 			},
 
-			// src/App.vue (在 methods 内部)
-
 			async handleHumanMove(coords) {
-				// 【保留】前置校验和锁定
 				if (this.gameStatus !== 'Ongoing' || this.currentPlayer !== 1 || this.isProcessing) return;
 
 				const {
@@ -161,34 +199,29 @@
 					action
 				} = coords;
 
-				// ... (合法性检查和 isProcessing = true 保持不变) ...
-
 				this.isProcessing = true;
 				this.gameStatus = 'Processing Move...';
 
 				try {
-					// 步骤 1: 发送人类移动请求 (后端只处理人类移动)
+					// Step 1: Send human move request
 					const response = await axios.post(`${API_BASE_URL}/human_move`, {
 						x,
 						y,
 						action
 					});
 
-					// 步骤 2: 更新棋盘状态 (触发人类翻转动画)
+					// Step 2: Update board state (now it's AI's turn)
 					this.updateGameState(response.data);
 
-					// 步骤 3: 【关键】等待人类翻转动画完成
+					// Step 3: Wait for human flip animation
 					await waitForDelay(FLIP_ANIMATION_DURATION);
 
-					// 步骤 4: 检查游戏状态，如果轮到 AI，则触发 AI 移动
+					// Step 4: Check state; if it's AI's turn, trigger AI move
 					if (this.gameStatus === 'Ongoing' && this.currentPlayer === -1) {
-
-						// 立即调用 AI 移动函数，由 handleAIMove 接管后续流程和锁定状态
+						// handleAIMove takes over processing lock
 						this.handleAIMove();
-						// 注意：这里 handleHumanMove 立即结束，isProcessing 会在 handleAIMove 中解除。
-
 					} else {
-						// 步骤 5: 如果游戏结束或人 Pass 后仍然是人下，解除锁定
+						// Game ended or human passed back to human
 						this.isProcessing = false;
 					}
 
@@ -197,7 +230,6 @@
 					this.gameStatus = 'Error during human move';
 					this.isProcessing = false;
 				}
-				// 【移除】这里的 finally 块被移除，因为 isProcessing 的解除被转移到了 handleAIMove 或 else 分支中。
 			},
 
 			updateGameState(data) {
@@ -206,10 +238,13 @@
 				this.currentPlayer = data.current_player;
 				this.lastMove = data.last_move;
 				this.gameStatus = data.status;
-				// this.pieceCounts = data.piece_counts;
+
+				// 【CORE FIX】Always use the history_length provided by the backend
+				if (data.history_length !== undefined) {
+					this.historyLength = data.history_length;
+				}
 
 				if (this.gameStatus === 'Ongoing' && this.currentPlayer === -1 && !this.isProcessing) {
-					// 如果轮到 AI 并且游戏仍在进行中，更新状态提示
 					this.gameStatus = 'AI is thinking...';
 				}
 			}
@@ -233,5 +268,32 @@
 		padding: 15px;
 		border: 2px solid red;
 		background-color: #ffe0e0;
+	}
+
+	/* Optional: Basic styling for the undo button */
+	.undo-button {
+		padding: 10px 20px;
+		background-color: #fca5a5;
+		color: #333;
+		border: none;
+		border-radius: 8px;
+		cursor: pointer;
+		font-weight: bold;
+		transition: background-color 0.2s;
+		box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+	}
+
+	.undo-button:hover:not(:disabled) {
+		background-color: #f87171;
+	}
+
+	.undo-button:disabled {
+		background-color: #ccc;
+		color: #666;
+		cursor: not-allowed;
+	}
+	
+	.game-info {
+		margin-top: 20px;
 	}
 </style>
